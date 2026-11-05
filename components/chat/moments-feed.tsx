@@ -2,8 +2,20 @@
 
 import { useState, useEffect, useCallback, useLayoutEffect, useRef } from "react";
 import { getAllPosts, deleteMomentPost, getUnreadMomentsNotifications, saveMomentsLastSeen, addMomentComment } from "@/lib/moments-storage";
-import { loadChatContacts } from "@/lib/chat-storage";
-import { resolveUserIdentity, USER_IDENTITIES_UPDATED_EVENT } from "@/lib/settings-storage";
+import { loadChatContacts, resolveChatCharacterAvatar } from "@/lib/chat-storage";
+import { loadCharacters } from "@/lib/character-storage";
+import { CHARACTER_MOMENTS_PROFILE_UPDATED, getCharacterMomentPosts, loadCharacterMomentsProfile, saveCharacterMomentsProfile } from "@/lib/character-moments-profile";
+import { USER_IDENTITIES_UPDATED_EVENT, loadUserIdentities } from "@/lib/settings-storage";
+import { CharacterMomentsActions } from "./character-moments-actions";
+import {
+    CHAT_SCOPE_UPDATED_EVENT,
+    characterMatchesChatScope,
+    loadChatScope,
+    resolveChatScopeUserIdentity,
+    resolveChatAccountUserIdentity,
+    type ChatScopeState,
+} from "@/lib/chat-scope-storage";
+import { findChatAltAccount } from "@/lib/chat-alt-account-storage";
 import { saveChatImageToIndexedDB, getChatImageFromIndexedDB } from "@/lib/chat-asset-storage";
 import type { MomentComment, MomentPost } from "@/lib/moments-types";
 import { MomentPostCard } from "./moment-post-card";
@@ -16,8 +28,29 @@ import { onUserComment, MOMENT_PHOTO_GENERATION_FAILED_EVENT } from "@/lib/momen
 import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 
 const COVER_ASSET_KEY = "moments_cover_asset_id";
+const IDENTITY_PROFILE_KEY = "moments_identity_profiles_v1";
 registerKvMigration(COVER_ASSET_KEY);
 registerKvMigration("moments_signature");
+registerKvMigration(IDENTITY_PROFILE_KEY);
+
+type MomentsIdentityProfile = { coverAssetId?: string; signature?: string };
+
+function loadIdentityProfiles(): Record<string, MomentsIdentityProfile> {
+    try {
+        const raw = kvGet(IDENTITY_PROFILE_KEY);
+        return raw ? JSON.parse(raw) as Record<string, MomentsIdentityProfile> : {};
+    } catch {
+        return {};
+    }
+}
+
+function saveIdentityProfile(identityId: string, patch: MomentsIdentityProfile): void {
+    const profiles = loadIdentityProfiles();
+    kvSet(IDENTITY_PROFILE_KEY, JSON.stringify({
+        ...profiles,
+        [identityId]: { ...(profiles[identityId] || {}), ...patch },
+    }));
+}
 
 const MOMENTS_INITIAL_POST_COUNT = 10;
 const MOMENTS_LOAD_MORE_COUNT = 10;
@@ -39,9 +72,18 @@ type ActiveMomentComposer = {
 
 type MomentsFeedProps = {
     onCloseApp: () => void;
+    compact?: boolean;
+    onUserPublished?: (post: MomentPost) => void;
+    profileCharacterId?: string;
+    profileUser?: { identityId?: string; chatAccountId?: string | null };
 };
 
-export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
+export function MomentsFeed({ onCloseApp, compact = false, onUserPublished, profileCharacterId, profileUser }: MomentsFeedProps) {
+    const profileCharacter = profileCharacterId ? loadCharacters().find(character => character.id === profileCharacterId) : undefined;
+    const [profileRevision, setProfileRevision] = useState(0);
+    const [userPage, setUserPage] = useState<MomentsFeedProps["profileUser"] | null>(null);
+    const [coverMenuOpen, setCoverMenuOpen] = useState(false);
+    const personalMode = Boolean(profileCharacterId || profileUser);
     const [posts, setPosts] = useState<MomentPost[]>([]);
     const [showCompose, setShowCompose] = useState(false);
     const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -50,7 +92,13 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
     const [coverUrl, setCoverUrl] = useState<string | null>(null);
     const coverInputRef = useRef<HTMLInputElement>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
-    const [userIdentity, setUserIdentity] = useState(() => resolveUserIdentity());
+    const [chatScope, setChatScope] = useState<ChatScopeState>(() => loadChatScope());
+    const [userIdentity, setUserIdentity] = useState(() => resolveChatScopeUserIdentity());
+    const ownerIdentity = profileUser
+        ? profileUser.chatAccountId ? resolveChatAccountUserIdentity(profileUser.chatAccountId) : loadUserIdentities().find(identity => identity.id === profileUser.identityId) || userIdentity
+        : userIdentity;
+    const profileName = profileCharacterId ? profileCharacter?.name || "角色" : ownerIdentity?.name || "我";
+    const profileAvatar = profileCharacterId ? resolveChatCharacterAvatar(profileCharacter) : ownerIdentity?.avatarUrl;
     const [signature, setSignature] = useState(() => {
         if (typeof window !== "undefined") {
             return kvGet("moments_signature") || "make every day count (●ˇ∀ˇ●)";
@@ -59,16 +107,29 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
     });
 
     useEffect(() => {
-        const syncIdentity = () => setUserIdentity(resolveUserIdentity());
+        const syncIdentity = () => {
+            setChatScope(loadChatScope());
+            setUserIdentity(resolveChatScopeUserIdentity());
+        };
         window.addEventListener(USER_IDENTITIES_UPDATED_EVENT, syncIdentity);
-        return () => window.removeEventListener(USER_IDENTITIES_UPDATED_EVENT, syncIdentity);
+        window.addEventListener(CHAT_SCOPE_UPDATED_EVENT, syncIdentity);
+        window.addEventListener("settings-bindings-updated", syncIdentity);
+        window.addEventListener("character-worlds-updated", syncIdentity);
+        return () => {
+            window.removeEventListener(USER_IDENTITIES_UPDATED_EVENT, syncIdentity);
+            window.removeEventListener(CHAT_SCOPE_UPDATED_EVENT, syncIdentity);
+            window.removeEventListener("settings-bindings-updated", syncIdentity);
+            window.removeEventListener("character-worlds-updated", syncIdentity);
+        };
     }, []);
     const [editingSignature, setEditingSignature] = useState(false);
     const sigInputRef = useRef<HTMLInputElement>(null);
     const handleSignatureSubmit = (val: string) => {
-        const trimmed = val.trim() || "make every day count (●ˇ∀ˇ●)";
+        const trimmed = val.trim() || (profileCharacterId ? "" : "make every day count (●ˇ∀ˇ●)");
         setSignature(trimmed);
-        kvSet("moments_signature", trimmed);
+        if (profileCharacterId) saveCharacterMomentsProfile(profileCharacterId, { signature: trimmed });
+        else if (ownerIdentity?.id) saveIdentityProfile(ownerIdentity.id, { signature: trimmed });
+        else kvSet("moments_signature", trimmed);
         setEditingSignature(false);
     };
 
@@ -105,10 +166,27 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
     useEffect(() => stopLoadMoreAnchorTracking, [stopLoadMoreAnchorTracking]);
 
     const refreshPosts = useCallback(() => {
-        const contactIds = new Set(loadChatContacts().map(c => c.characterId));
-        setPosts(getAllPosts().filter(p => p.authorType === "user" || contactIds.has(p.authorId)));
+        if (profileCharacterId) {
+            setPosts(getCharacterMomentPosts(getAllPosts(), profileCharacterId));
+            setUnreadNotifs([]);
+            return;
+        }
+        if (profileUser) {
+            setPosts(getAllPosts().filter(post => post.authorType === "user" && (post.chatAccountId || null) === (profileUser.chatAccountId || null)
+                && (profileUser.chatAccountId || !post.userIdentityId || post.userIdentityId === profileUser.identityId)));
+            setUnreadNotifs([]); return;
+        }
+        const altAccount = findChatAltAccount(chatScope.chatAccountId);
+        const contactIds = new Set(altAccount ? altAccount.friendCharacterIds : loadChatContacts().map(c => c.characterId));
+        setPosts(getAllPosts().filter(post => {
+            if (post.authorType === "user") {
+                if ((post.chatAccountId || null) !== chatScope.chatAccountId) return false;
+                return Boolean(chatScope.chatAccountId) || !chatScope.userIdentityId || !post.userIdentityId || post.userIdentityId === chatScope.userIdentityId;
+            }
+            return contactIds.has(post.authorId) && characterMatchesChatScope(post.authorId, chatScope);
+        }));
         setUnreadNotifs(getUnreadMomentsNotifications());
-    }, []);
+    }, [chatScope, profileCharacterId, profileUser]);
 
     const captureScrollAnchor = useCallback((): MomentScrollAnchorSnapshot | null => {
         const el = getScrollElement();
@@ -243,6 +321,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
             postId: target.postId,
             authorType: "user",
             authorId: "user",
+            chatAccountId: chatScope.chatAccountId || undefined,
             content: text,
             replyToCommentId: target.replyTo?.commentId,
             replyToAuthorId: target.replyTo?.authorId,
@@ -253,7 +332,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
         refreshPosts();
         window.dispatchEvent(new CustomEvent("moments-updated"));
         onUserComment(target.postId);
-    }, [activeComposer, closeComposer, composerText, refreshPosts]);
+    }, [activeComposer, chatScope.chatAccountId, closeComposer, composerText, refreshPosts]);
 
     useEffect(() => {
         if (!activeComposer) return;
@@ -305,27 +384,41 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
         };
         window.addEventListener(MOMENT_PHOTO_GENERATION_FAILED_EVENT, photoFailureHandler);
 
-        // Load saved cover image
-        const savedId = kvGet(COVER_ASSET_KEY);
-        if (savedId) {
-            getChatImageFromIndexedDB(savedId).then(url => {
-                if (url) setCoverUrl(url);
-            });
-        }
-
         return () => {
             window.removeEventListener("moments-updated", handler);
             window.removeEventListener(MOMENT_PHOTO_GENERATION_FAILED_EVENT, photoFailureHandler);
         };
     }, [refreshPosts]);
 
+    useEffect(() => {
+        let cancelled = false;
+        const characterProfile = profileCharacterId ? loadCharacterMomentsProfile(profileCharacterId) : undefined;
+        const identityProfile = ownerIdentity?.id ? loadIdentityProfiles()[ownerIdentity.id] : undefined;
+        setSignature(profileCharacterId ? characterProfile?.signature || "" : identityProfile?.signature || kvGet("moments_signature") || "make every day count (●ˇ∀ˇ●)");
+        const savedId = profileCharacterId ? characterProfile?.coverAssetId : identityProfile?.coverAssetId || kvGet(COVER_ASSET_KEY);
+        setCoverUrl(null);
+        if (savedId) {
+            getChatImageFromIndexedDB(savedId).then(url => {
+                if (!cancelled && url) setCoverUrl(url);
+            });
+        }
+        return () => { cancelled = true; };
+    }, [ownerIdentity?.id, profileCharacterId, profileRevision]);
+    useEffect(() => {
+        const update = (event: Event) => {
+            if ((event as CustomEvent<{ characterId: string }>).detail?.characterId === profileCharacterId) setProfileRevision(value => value + 1);
+        };
+        window.addEventListener(CHARACTER_MOMENTS_PROFILE_UPDATED, update);
+        return () => window.removeEventListener(CHARACTER_MOMENTS_PROFILE_UPDATED, update);
+    }, [profileCharacterId]);
+
     // Hide tab bar only when the full compose page is open.
     useEffect(() => {
-        window.dispatchEvent(new CustomEvent("chat-hide-tabbar", { detail: showCompose }));
+        window.dispatchEvent(new CustomEvent("chat-hide-tabbar", { detail: showCompose || personalMode || Boolean(userPage) }));
         return () => {
             window.dispatchEvent(new CustomEvent("chat-hide-tabbar", { detail: false }));
         };
-    }, [showCompose]);
+    }, [showCompose, personalMode, userPage]);
 
 
     const handleDeleteConfirm = () => {
@@ -337,10 +430,11 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
         }
     };
 
-    const handlePublished = () => {
+    const handlePublished = (post: MomentPost) => {
         setShowCompose(false);
         refreshPosts();
         window.dispatchEvent(new CustomEvent("moments-updated"));
+        onUserPublished?.(post);
     };
 
     const handleCoverUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -365,7 +459,9 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
                 URL.revokeObjectURL(objectUrl);
                 if (!blob) return;
                 saveChatImageToIndexedDB(blob).then(assetId => {
-                    kvSet(COVER_ASSET_KEY, assetId);
+                    if (profileCharacterId) saveCharacterMomentsProfile(profileCharacterId, { coverAssetId: assetId });
+                    else if (ownerIdentity?.id) saveIdentityProfile(ownerIdentity.id, { coverAssetId: assetId });
+                    else kvSet(COVER_ASSET_KEY, assetId);
                     getChatImageFromIndexedDB(assetId).then(url => {
                         if (url) setCoverUrl(url);
                     });
@@ -379,6 +475,8 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
 
     return (
         <>
+        {userPage && <MomentsFeed key={`${userPage.chatAccountId || "main"}:${userPage.identityId || "user"}`} profileUser={userPage} onCloseApp={() => setUserPage(null)} />}
+        <div style={{ display: userPage ? "none" : "contents" }}>
         {photoFailureNotice && (
             <GeneratedImageErrorDialog
                 message={photoFailureNotice}
@@ -386,9 +484,9 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
             />
         )}
         <PageShell
-            title="动态"
+            title={personalMode ? "朋友圈" : "动态"}
             onBack={onCloseApp}
-            rightAction={
+            rightAction={personalMode ? undefined :
                 <button
                     onClick={() => setShowCompose(true)}
                     className="page-back-btn"
@@ -403,7 +501,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
                     </svg>
                 </button>
             }
-            className={`moments-feed-page ${headerScrolled ? "is-scrolled" : ""} ${activeComposer ? "has-comment-modal" : ""}`}
+            className={`moments-feed-page ${personalMode ? "contact-moments-page" : ""} ${compact ? "moments-feed-compact" : ""} ${headerScrolled ? "is-scrolled" : ""} ${activeComposer ? "has-comment-modal" : ""}`}
             bodyRef={scrollRef}
             footer={showCompose ? (
                 <MomentsCompose
@@ -465,7 +563,19 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
             ) : undefined}
         >
                 {/* Cover card + avatar wrapper */}
-                <div className="feed-cover-shell w-full relative mb-4">
+                {personalMode ? <section className="contact-moments-header">
+                    <button type="button" className="contact-moments-cover" aria-label={profileCharacterId ? "更换角色朋友圈封面" : "更换用户朋友圈封面"} onClick={() => { if (profileCharacterId) setCoverMenuOpen(value => !value); else coverInputRef.current?.click(); }}>
+                        {coverUrl ? <img src={coverUrl} alt="朋友圈封面" /> : <span>轻触设置朋友圈封面</span>}
+                    </button>
+                    <input ref={coverInputRef} type="file" accept="image/*" className="hidden" onChange={handleCoverUpload} />
+                    <div className="contact-moments-identity"><strong>{profileName}</strong><div className="contact-profile-avatar">
+                        {profileAvatar ? <img src={profileAvatar} alt={profileName} /> : <span>{profileName[0]}</span>}
+                    </div></div>
+                    <div className="contact-moments-signature">{editingSignature ? <input ref={sigInputRef} autoFocus aria-label={profileCharacterId ? "角色朋友圈个性签名" : "用户朋友圈个性签名"} defaultValue={signature}
+                        onBlur={event => handleSignatureSubmit(event.target.value)} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+                        : <button type="button" onClick={() => setEditingSignature(true)}>{signature || "添加个性签名"}</button>}</div>
+                    {profileCharacterId && <CharacterMomentsActions key={profileCharacterId} characterId={profileCharacterId} coverOpen={coverMenuOpen} onCoverClose={() => setCoverMenuOpen(false)} onUpload={() => coverInputRef.current?.click()} />}
+                </section> : <div className="feed-cover-shell w-full relative mb-4">
                     
                     {/* Background Absolute Cover */}
                     <div
@@ -498,7 +608,9 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
                         style={{ paddingTop: "calc(var(--page-header-safe-top, 48px) + var(--page-header-content-height, 54px) + 160px)" }}
                     >
                         {/* Avatar */}
-                        <div className="feed-profile-avatar w-[72px] h-[72px] rounded-full border-[3px] border-[var(--c-page-body-bg)] bg-[var(--c-input)] overflow-hidden flex items-center justify-center translate-x-[2px] pointer-events-auto">
+                        <div className="feed-profile-avatar w-[72px] h-[72px] rounded-full border-[3px] border-[var(--c-page-body-bg)] bg-[var(--c-input)] overflow-hidden flex items-center justify-center translate-x-[2px] pointer-events-auto"
+                            role="button" tabIndex={0} aria-label="打开我的个人朋友圈" onClick={() => setUserPage({ identityId: userIdentity?.id, chatAccountId: chatScope.chatAccountId })}
+                            onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setUserPage({ identityId: userIdentity?.id, chatAccountId: chatScope.chatAccountId }); } }}>
                             {userIdentity?.avatarUrl ? (
                                 <img src={userIdentity.avatarUrl} alt="" className="feed-profile-avatar-image w-full h-full object-cover" />
                             ) : (
@@ -534,10 +646,10 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
                             </div>
                         </div>
                     </div>
-                </div>
+                </div>}
 
                 {/* Unread notifications banner */}
-                {unreadNotifs.length > 0 && (
+                {!personalMode && unreadNotifs.length > 0 && (
                     <button
                         className="feed-notif-banner"
                         onClick={() => setShowNotifModal(true)}
@@ -549,7 +661,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
                 {/* Posts list */}
                 {posts.length === 0 ? (
                     <div className="feed-empty-state py-10 text-center text-[var(--c-icon)] ts-14">
-                        还没有动态，发一条吧
+                        {personalMode ? "还没有发布过朋友圈" : "还没有动态，发一条吧"}
                     </div>
                 ) : (
                     visiblePosts.map(post => (
@@ -560,6 +672,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
                             onRequestDelete={setConfirmDeleteId}
                             onOpenCommentComposer={openCommentComposer}
                             onOpenReplyComposer={openReplyComposer}
+                            onOpenUserProfile={profileUser ? undefined : post => setUserPage({ identityId: post.userIdentityId || userIdentity?.id, chatAccountId: post.chatAccountId || null })}
                         />
                     ))
                 )}
@@ -622,6 +735,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
             )}
 
         </PageShell>
+        </div>
         </>
     );
 }

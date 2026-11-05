@@ -33,8 +33,8 @@ import {
     loadPresets,
     loadWorldBooks,
     loadRegexes,
-    resolveUserIdentity,
 } from "./settings-storage";
+import { resolveChatScopeUserIdentity } from "./chat-scope-storage";
 import type { PresetConfig, ApiConfig } from "./settings-types";
 import { loadMemoryConfig, incrementEventCounter } from "./memory-storage";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
@@ -215,7 +215,7 @@ async function resolveAssemblerInput(
         .filter(Boolean) as typeof allRegexes;
 
     // 6. Resolve user identity via binding cascade
-    const userIdentity = resolveUserIdentity(characterId, "chat");
+    const userIdentity = resolveChatScopeUserIdentity(characterId, "chat");
 
     // 7. Load long-term memories (NPC doesn't share the character's memory)
     let coreMemories = "";
@@ -353,6 +353,7 @@ async function triggerAIPost(characterId: string): Promise<void> {
             content: parsed.content,
             photoDescription: parsed.photoDescription,
             photoUseReferenceImage: parsed.photoUseReferenceImage === true,
+            photoUseUserReferenceImage: parsed.photoUseUserReferenceImage === true,
             photoGenerationStatus: parsed.photoDescription ? "pending" : undefined,
             visibility,
         });
@@ -362,7 +363,7 @@ async function triggerAIPost(characterId: string): Promise<void> {
         }
 
         if (parsed.photoDescription) {
-            attachMomentPhotoInBackground(post.id, parsed.photoDescription, characterId, parsed.photoUseReferenceImage === true);
+            attachMomentPhotoInBackground(post.id, parsed.photoDescription, characterId, parsed.photoUseReferenceImage === true, parsed.photoUseUserReferenceImage === true);
         }
 
         // Increment event counter for auto-summarization (native data read at summarization time)
@@ -1149,6 +1150,7 @@ export function parseMomentPostResponse(rawText: string): {
     content: string;
     photoDescription?: string;
     photoUseReferenceImage?: boolean;
+    photoUseUserReferenceImage?: boolean;
 } | null {
     const blockMatch = rawText.match(/\[朋友圈\]\s*([\s\S]*?)\s*\[\/朋友圈\]/);
     const text = blockMatch ? blockMatch[1] : rawText;
@@ -1163,6 +1165,10 @@ export function parseMomentPostResponse(rawText: string): {
         : legacyPhotoMatch
             ? /(?:自拍|对镜拍|selfie)/i.test(photoDescription || "")
             : false;
+    // This is the permission gate. The image service reads the bound identity
+    // and decides from the text-model-authored description whether the user is
+    // actually present, so scenery/object photos do not receive the user face.
+    const photoUseUserReferenceImage = Boolean(photoDescription);
 
     const content = text
         .replace(/\[照片[:：]\s*(?:使用参考图|不使用参考图)\s*[:：]\s*[\s\S]*?\]/g, "")
@@ -1172,7 +1178,7 @@ export function parseMomentPostResponse(rawText: string): {
 
     if (!content) return null;
 
-    return { content, photoDescription, photoUseReferenceImage };
+    return { content, photoDescription, photoUseReferenceImage, photoUseUserReferenceImage };
 }
 
 // ── Helpers ──
@@ -1186,21 +1192,25 @@ export function attachMomentPhotoInBackground(
     description: string,
     characterId: string,
     useReferenceImage: boolean,
+    useUserReferenceImage: boolean,
     signal?: AbortSignal,
 ): void {
     void (async () => {
         let photoUrl: string | undefined;
+        let photoGenerationPrompt: string | undefined;
         let errorMessage: string | undefined;
         let aborted = false;
         try {
-            photoUrl = await generateMomentPhotoUrl(description, characterId, useReferenceImage, signal);
+            const generated = await generateMomentPhotoUrl(description, characterId, useReferenceImage, useUserReferenceImage, signal);
+            photoUrl = generated?.url;
+            photoGenerationPrompt = generated?.prompt;
         } catch (error) {
             aborted = isAbortError(error);
             errorMessage = error instanceof Error ? error.message : String(error);
         }
         const reason = errorMessage || "生图配置未启用或生成失败";
         updateMomentPost(postId, photoUrl
-            ? { photoUrl, photoGenerationStatus: "generated", photoGenerationError: undefined }
+            ? { photoUrl, photoGenerationPrompt, photoGenerationStatus: "generated", photoGenerationError: undefined }
             : { photoGenerationStatus: "failed", photoGenerationError: reason });
         dispatchMomentsUpdated();
         // 失败时只在当下弹一次提示（卡片上不再挂红字），中断不算失败
@@ -1219,8 +1229,9 @@ export async function generateMomentPhotoUrl(
     description: string,
     characterId: string,
     useReferenceImage: boolean,
+    useUserReferenceImage: boolean,
     signal?: AbortSignal,
-): Promise<string | undefined> {
+): Promise<{ url: string; prompt: string } | undefined> {
     try {
         throwIfAborted(signal);
         const generated = await generateImageFromConfiguredApi({
@@ -1228,13 +1239,14 @@ export async function generateMomentPhotoUrl(
             characterId,
             appId: "moments",
             useReferenceImage,
+            includeUserReferenceImage: useUserReferenceImage ? undefined : false,
             signal,
         });
         throwIfAborted(signal);
         if (!generated) return undefined;
         const assetId = await saveChatImageToIndexedDB(generated.blob);
         throwIfAborted(signal);
-        return `asset://${assetId}`;
+        return { url: `asset://${assetId}`, prompt: generated.prompt };
     } catch (error) {
         if (isAbortError(error)) throw error;
         console.warn("[Moments] Image generation failed:", error);
@@ -1244,7 +1256,7 @@ export async function generateMomentPhotoUrl(
 
 function getUserName(characterId?: string): string {
     try {
-        const identity = resolveUserIdentity(characterId, "chat");
+        const identity = resolveChatScopeUserIdentity(characterId, "chat");
         return identity?.name || "我";
     } catch {
         return "我";

@@ -130,7 +130,7 @@ async function externalFetch(url: string, init: RequestInit): Promise<Response> 
 }
 
 async function fetchImageUrl(url: string): Promise<{ b64: string; mimeType: string }> {
-  const res = await externalFetch(url, { method: "GET" });
+  const res = await externalFetch(url, { method: "GET", signal: AbortSignal.timeout(45_000) });
   if (!res.ok) {
     const err = await res.text().catch(() => "");
     throw new Error(`图片 URL 下载失败 ${res.status}: ${err.slice(0, 160)}`);
@@ -208,13 +208,19 @@ async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ st
 
     const { width, height } = getNovelAiResolution(input.size);
 
-    const url = "https://image.novelai.net/ai/generate-image";
+    const customUrl = input.baseUrl?.trim();
+    if (customUrl && !/^https?:\/\//i.test(customUrl)) {
+      return { status: 400, body: { error: "NovelAI 自定义 URL 必须以 http:// 或 https:// 开头" } };
+    }
+    const url = customUrl || "https://image.novelai.net/ai/generate-image";
     const headers: Record<string, string> = {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      Origin: "https://novelai.net",
-      Referer: "https://novelai.net/",
     };
+    if (!customUrl) {
+      headers.Origin = "https://novelai.net";
+      headers.Referer = "https://novelai.net/";
+    }
 
     const parameters: Record<string, unknown> = {
       width,
@@ -359,8 +365,16 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     }
 
     if (extracted.kind === "url") {
-      const downloaded = await fetchImageUrl(extracted.url);
-      return { status: 200, body: { ...downloaded, revisedPrompt: extracted.revisedPrompt } };
+      // Preserve a completed generation even when downloading the CDN result fails.
+      try {
+        const downloaded = await fetchImageUrl(extracted.url);
+        return { status: 200, body: { ...downloaded, revisedPrompt: extracted.revisedPrompt } };
+      } catch {
+        return { status: 502, body: {
+          error: "图片已生成，但服务端下载失败", generationCompleted: true,
+          imageUrl: extracted.url, revisedPrompt: extracted.revisedPrompt,
+        } };
+      }
     }
 
     return {

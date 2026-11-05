@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 import { findCustomStickerByName, resolveCustomStickerUrl } from "@/lib/custom-sticker-storage";
 import { isMediaStoreRef, loadMediaObjectUrl } from "@/lib/media-cache-storage";
 import { getChatImageFromIndexedDB } from "@/lib/chat-asset-storage";
-import { ChatMessage, createOrGetSession, loadChatAppSettings, resolveMeetingInviteCardConfig, updateMessageMediaStatus, updateMessageMediaData } from "@/lib/chat-storage";
+import { ChatMessage, createOrGetSession, loadChatAppSettings, resolveChatCharacterAvatar, resolveMeetingInviteCardConfig, updateMessageMediaStatus, updateMessageMediaData } from "@/lib/chat-storage";
 import { resolveContactCard } from "@/lib/contact-card";
 import { loadCharacters } from "@/lib/character-storage";
 import { CHAT_OPEN_SESSION_EVENT, dispatchOpenAddContact } from "@/lib/chat-notification-events";
@@ -23,7 +23,7 @@ import remarkBreaks from "remark-breaks";
 import { createPortal } from "react-dom";
 import { Blocks, Maximize2, ReceiptText } from "lucide-react";
 import { retryChatGeneratedImage } from "@/lib/generated-image-retry";
-import { hasCharacterReferenceImage } from "@/lib/image-generation-service";
+import { hasCharacterReferenceImage, hasUserReferenceImage } from "@/lib/image-generation-service";
 import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 import { ScanPayCard } from "@/components/chat/scan-pay-card";
 import { payWithWalletBalance } from "@/lib/wallet-storage";
@@ -47,6 +47,7 @@ interface MessageBubbleProps {
     onMeetingInviteAction?: (msg: ChatMessage, action: "accept" | "decline") => void;
     displayContent?: string;
     defaultTranslationExpanded?: boolean;
+    onFavoriteMedia?: (msg: ChatMessage) => void | Promise<void>;
 }
 
 /** 聊天插件自定义消息气泡：把裸 DOM 容器交给注册了该 kind 的插件渲染 */
@@ -90,7 +91,7 @@ function PluginKindBubble({ msg, kind }: { msg: ChatMessage; kind: string }) {
  * Renders a message bubble based on its mediaType.
  * Falls back to ReactMarkdown for plain text messages.
  */
-export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charName, userName, onSystemMessage, groupSize, onShowDetail, characterId, onMusicPlay, onActionSelect, onMeetingInviteAction, displayContent, defaultTranslationExpanded = false }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charName, userName, onSystemMessage, groupSize, onShowDetail, characterId, onMusicPlay, onActionSelect, onMeetingInviteAction, displayContent, defaultTranslationExpanded = false, onFavoriteMedia }: MessageBubbleProps) {
     switch (msg.mediaType) {
         case "red_packet":
             return <RedPacketBubble msg={msg} charName={charName} userName={userName} groupSize={groupSize} onShowDetail={onShowDetail} />;
@@ -105,7 +106,7 @@ export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charNa
         case "app_card":
             return <AppCardBubble msg={msg} characterId={characterId} characterName={msg.senderName || charName} />;
         case "image":
-            return <ImageBubble msg={msg} onUpdate={onUpdate} characterId={characterId} />;
+            return <ImageBubble msg={msg} onUpdate={onUpdate} characterId={characterId} onFavorite={onFavoriteMedia} />;
         case "location":
             return <LocationBubble msg={msg} />;
         case "poke":
@@ -1116,8 +1117,8 @@ function ContactCardBubble({ msg, characterId }: { msg: ChatMessage; characterId
             <div className="chat-contact-card" onClick={handleClick} role="button">
                 <div className="chat-contact-card-main">
                     <div className="chat-contact-card-avatar">
-                        {resolved.character?.avatar
-                            ? <img src={resolved.character.avatar} alt="" />
+                        {resolveChatCharacterAvatar(resolved.character)
+                            ? <img src={resolveChatCharacterAvatar(resolved.character)} alt="" />
                             : <CharAvatarFallbackInline name={contactName} />}
                     </div>
                     <div className="chat-contact-card-info">
@@ -1246,6 +1247,9 @@ function GeneratedImagePromptDialog({
     useReferenceImage,
     onUseReferenceImageChange,
     hasReferenceImage,
+    useUserReferenceImage,
+    onUseUserReferenceImageChange,
+    hasUserReference,
 }: {
     value: string;
     onChange: (value: string) => void;
@@ -1256,6 +1260,9 @@ function GeneratedImagePromptDialog({
     useReferenceImage: boolean;
     onUseReferenceImageChange: (useRef: boolean) => void;
     hasReferenceImage: boolean;
+    useUserReferenceImage: boolean;
+    onUseUserReferenceImageChange: (useRef: boolean) => void;
+    hasUserReference: boolean;
 }) {
     return (
         <div
@@ -1296,6 +1303,19 @@ function GeneratedImagePromptDialog({
                     ) : (
                         <div className="chat-generated-image-prompt-empty-hint">该角色未配置参考图</div>
                     )}
+                    {hasUserReference ? (
+                        <label className="chat-generated-image-prompt-check">
+                            <input
+                                type="checkbox"
+                                checked={useUserReferenceImage}
+                                disabled={busy}
+                                onChange={e => onUseUserReferenceImageChange(e.target.checked)}
+                            />
+                            <span>允许使用用户参考图（文字模型判断用户是否出镜）</span>
+                        </label>
+                    ) : (
+                        <div className="chat-generated-image-prompt-empty-hint">当前用户身份未配置参考图</div>
+                    )}
                     {error && <div className="chat-generated-image-retry-error">{error}</div>}
                 </div>
                 <div className="modal-footer" data-ui="modal-footer">
@@ -1317,10 +1337,12 @@ function ImageBubble({
     msg,
     onUpdate,
     characterId,
+    onFavorite,
 }: {
     msg: ChatMessage;
     onUpdate?: (updated: ChatMessage) => void;
     characterId?: string;
+    onFavorite?: (msg: ChatMessage) => void | Promise<void>;
 }) {
     const d = msg.mediaData;
     const label = d?.label || "照片";
@@ -1340,7 +1362,9 @@ function ImageBubble({
     const [showPreview, setShowPreview] = useState(false);
 
     const [hasRef, setHasRef] = useState(() => hasCharacterReferenceImage(characterId));
+    const [hasUserRef, setHasUserRef] = useState(() => hasUserReferenceImage(characterId, "chat"));
     const [useReferenceDraft, setUseReferenceDraft] = useState(d?.useReferenceImage === true);
+    const [useUserReferenceDraft, setUseUserReferenceDraft] = useState(d?.useUserReferenceImage === true);
 
     useEffect(() => {
         if (!isMediaStoreRef(rawUrl)) {
@@ -1358,12 +1382,15 @@ function ImageBubble({
 
     const openPromptEditor = useCallback(() => {
         const latestHasRef = hasCharacterReferenceImage(characterId);
+        const latestHasUserRef = hasUserReferenceImage(characterId, "chat");
         setHasRef(latestHasRef);
+        setHasUserRef(latestHasUserRef);
         setPromptDraft(d?.label?.trim() || "");
         setUseReferenceDraft(latestHasRef && d?.useReferenceImage === true);
+        setUseUserReferenceDraft(latestHasUserRef && d?.useUserReferenceImage === true);
         setRetryError("");
         setShowPromptEditor(true);
-    }, [characterId, d?.label, d?.useReferenceImage]);
+    }, [characterId, d?.label, d?.useReferenceImage, d?.useUserReferenceImage]);
 
     const handleRetry = useCallback(() => {
         const nextDescription = promptDraft.trim();
@@ -1375,7 +1402,8 @@ function ImageBubble({
         setShowPromptEditor(false);
         setRegenerating(true);
         setRetryError("");
-        retryChatGeneratedImage(msg, characterId, nextDescription, latestHasRef ? useReferenceDraft : undefined)
+        const latestHasUserRef = hasUserReferenceImage(characterId, "chat");
+        retryChatGeneratedImage(msg, characterId, nextDescription, latestHasRef ? useReferenceDraft : undefined, latestHasUserRef ? useUserReferenceDraft : false)
             .then(async (updated) => {
                 if (updated?.mediaUrl) {
                     try {
@@ -1394,7 +1422,7 @@ function ImageBubble({
             .finally(() => {
                 setRegenerating(false);
             });
-    }, [characterId, msg, onUpdate, promptDraft, useReferenceDraft]);
+    }, [characterId, msg, onUpdate, promptDraft, useReferenceDraft, useUserReferenceDraft]);
 
     // 预览层与提示词对话框：图片正常/失败占位两种形态共用（操作按钮统一收在点开后的预览层里）
     const previewAndDialog = (
@@ -1404,6 +1432,7 @@ function ImageBubble({
                     imageUrl={resolvedUrl || undefined}
                     description={!resolvedUrl ? label : undefined}
                     saveFilename={resolvedUrl ? ensureExtension(label, "image") : undefined}
+                    onFavorite={onFavorite ? () => onFavorite(msg) : undefined}
                     onRegenerate={canRegenerate ? () => { setShowPreview(false); openPromptEditor(); } : undefined}
                     regenerating={regenerating}
                     onClose={() => setShowPreview(false)}
@@ -1416,6 +1445,9 @@ function ImageBubble({
                     useReferenceImage={useReferenceDraft}
                     onUseReferenceImageChange={setUseReferenceDraft}
                     hasReferenceImage={hasRef}
+                    useUserReferenceImage={useUserReferenceDraft}
+                    onUseUserReferenceImageChange={setUseUserReferenceDraft}
+                    hasUserReference={hasUserRef}
                     onConfirm={handleRetry}
                     onCancel={() => setShowPromptEditor(false)}
                     busy={regenerating}
@@ -1910,6 +1942,7 @@ export function MediaImageWithPreview({
     onError,
     onRegenerate,
     regenerating,
+    onFavorite,
 }: {
     url: string;
     title: string;
@@ -1917,6 +1950,7 @@ export function MediaImageWithPreview({
     onError?: () => void;
     onRegenerate?: () => void;
     regenerating?: boolean;
+    onFavorite?: () => void | Promise<void>;
 }) {
     const [preview, setPreview] = useState(false);
     const saveName = filename || title;
@@ -1932,6 +1966,7 @@ export function MediaImageWithPreview({
                 <MediaPreviewOverlay
                     imageUrl={url}
                     saveFilename={ensureExtension(saveName, "image")}
+                    onFavorite={onFavorite}
                     onRegenerate={onRegenerate ? () => { setPreview(false); onRegenerate(); } : undefined}
                     regenerating={regenerating}
                     onClose={() => setPreview(false)}
@@ -2024,16 +2059,21 @@ function MediaFileBubble({
     }, []);
 
     const [hasRef, setHasRef] = useState(() => hasCharacterReferenceImage(characterId));
+    const [hasUserRef, setHasUserRef] = useState(() => hasUserReferenceImage(characterId, "chat"));
     const [imageUseReferenceDraft, setImageUseReferenceDraft] = useState(msg.mediaData?.useReferenceImage === true);
+    const [imageUseUserReferenceDraft, setImageUseUserReferenceDraft] = useState(msg.mediaData?.useUserReferenceImage === true);
 
     const openImagePromptEditor = useCallback(() => {
         const latestHasRef = hasCharacterReferenceImage(characterId);
+        const latestHasUserRef = hasUserReferenceImage(characterId, "chat");
         setHasRef(latestHasRef);
+        setHasUserRef(latestHasUserRef);
         setImagePromptDraft(msg.mediaData?.label?.trim() || "");
         setImageUseReferenceDraft(latestHasRef && msg.mediaData?.useReferenceImage === true);
+        setImageUseUserReferenceDraft(latestHasUserRef && msg.mediaData?.useUserReferenceImage === true);
         setImageRetryError("");
         setShowImagePromptEditor(true);
-    }, [characterId, msg.mediaData?.label, msg.mediaData?.useReferenceImage]);
+    }, [characterId, msg.mediaData?.label, msg.mediaData?.useReferenceImage, msg.mediaData?.useUserReferenceImage]);
 
     const handleRegenerateImage = useCallback(() => {
         const nextDescription = imagePromptDraft.trim();
@@ -2045,7 +2085,8 @@ function MediaFileBubble({
         setShowImagePromptEditor(false);
         setImageRegenerating(true);
         setImageRetryError("");
-        retryChatGeneratedImage(msg, characterId, nextDescription, latestHasRef ? imageUseReferenceDraft : undefined)
+        const latestHasUserRef = hasUserReferenceImage(characterId, "chat");
+        retryChatGeneratedImage(msg, characterId, nextDescription, latestHasRef ? imageUseReferenceDraft : undefined, latestHasUserRef ? imageUseUserReferenceDraft : false)
             .then(async (updated) => {
                 if (updated?.mediaUrl) {
                     try {
@@ -2064,7 +2105,7 @@ function MediaFileBubble({
             .finally(() => {
                 setImageRegenerating(false);
             });
-    }, [characterId, imagePromptDraft, imageUseReferenceDraft, msg, onUpdate]);
+    }, [characterId, imagePromptDraft, imageUseReferenceDraft, imageUseUserReferenceDraft, msg, onUpdate]);
 
     const handleSeek = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
         e.stopPropagation();
@@ -2185,6 +2226,9 @@ function MediaFileBubble({
                         useReferenceImage={imageUseReferenceDraft}
                         onUseReferenceImageChange={setImageUseReferenceDraft}
                         hasReferenceImage={hasRef}
+                        useUserReferenceImage={imageUseUserReferenceDraft}
+                        onUseUserReferenceImageChange={setImageUseUserReferenceDraft}
+                        hasUserReference={hasUserRef}
                         onConfirm={handleRegenerateImage}
                         onCancel={() => setShowImagePromptEditor(false)}
                         busy={imageRegenerating}
@@ -2354,7 +2398,7 @@ function synthesizeVoiceForMessage(msgId: string, characterId: string, speechTex
 function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpanded = false }: { msg: ChatMessage; characterId?: string; onUpdate?: (m: ChatMessage) => void; defaultTranslationExpanded?: boolean }) {
     const [playing, setPlaying] = useState(false);
     const [synthesizing, setSynthesizing] = useState(false);
-    const [synthFailed, setSynthFailed] = useState(false);
+    const [synthError, setSynthError] = useState<string | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const mountedRef = useRef(true);
     useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
@@ -2402,7 +2446,7 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
             return;
         }
         setSynthesizing(true);
-        setSynthFailed(false);
+        setSynthError(null);
         synthesizeVoiceForMessage(msg.id, characterId, speechText)
             .then((dataUrl) => {
                 if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: { ...msg.mediaData, synthesizedFromText: speechText } });
@@ -2410,10 +2454,12 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
                 setSynthesizing(false);
                 playSrc(dataUrl);
             })
-            .catch(() => {
+            .catch((error: unknown) => {
                 if (!mountedRef.current) return;
                 setSynthesizing(false);
-                setSynthFailed(true);
+                const message = error instanceof Error ? error.message : String(error);
+                setSynthError(message);
+                window.alert(`语音合成失败：${message}`);
             });
     };
 
@@ -2428,7 +2474,7 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
     });
 
     return (
-        <div className="voice-msg-bubble" onClick={handlePlay}
+        <div className="voice-msg-bubble" onClick={handlePlay} title={synthError || undefined}
             style={{ minWidth: `${Math.min(60 + duration * 8, 220)}px` }}
         >
             <div className="voice-msg-icon-shell">
@@ -2451,7 +2497,7 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
                     />
                 ))}
             </div>
-            <span className="voice-msg-dur">{synthFailed ? "合成失败·点击重试" : `${duration}"`}</span>
+            <span className="voice-msg-dur">{synthError ? "合成失败·点击重试" : `${duration}"`}</span>
         </div>
     );
 }

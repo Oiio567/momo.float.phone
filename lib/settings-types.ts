@@ -1,3 +1,5 @@
+import type { FaceCrop } from "./face-crop";
+
 export type SettingItemMeta = {
     id: string;
     name: string;
@@ -24,7 +26,17 @@ export type WorldBookEntry = {
 };
 
 export type WorldBookConfig = SettingItemMeta & {
+    /** 仅用于世界书管理页收纳；不参与绑定、触发或提示词组装。 */
+    folderId?: string;
     entries: WorldBookEntry[];
+};
+
+export type WorldBookFolder = {
+    id: string;
+    name: string;
+    order: number;
+    createdAt: number;
+    updatedAt: number;
 };
 
 // --- Preset ---
@@ -223,6 +235,9 @@ export type NovelAiPreset = {
 export type NovelAiSettings = {
     apiKey: string;
     requestMode?: ImageGenerationRequestMode;
+    /** 关闭时使用 NovelAI 官方生图地址；开启时直接请求 customUrl。 */
+    customUrlEnabled?: boolean;
+    customUrl?: string;
     activePresetId: string;
     presets: NovelAiPreset[];
 };
@@ -253,12 +268,25 @@ export type ImageGenerationSettings = {
         enabled?: boolean;
         /** 开启时，仅自拍语义的图片使用参考图，默认开启。 */
         selfieOnly?: boolean;
-        /** 归一化的正方形脸部选区。 */
-        faceCrop?: {
-            x: number;
-            y: number;
-            size: number;
-        };
+        /** 可独立调整宽高的脸部选区，兼容旧正方形数据。 */
+        faceCrop?: FaceCrop;
+        /** 该角色的服装、配饰与稳定特征锚点。 */
+        anchors?: Array<{
+            id: string;
+            name: string;
+            category: "accessory" | "clothing" | "feature" | "other";
+            description: string;
+            assetId?: string;
+            enabled: boolean;
+            updatedAt: number;
+        }>;
+    }>;
+    /** 用户身份专属参考图；按角色当前绑定的用户身份自动选择。 */
+    userReferences?: Record<string, {
+        assetId?: string;
+        updatedAt: number;
+        enabled?: boolean;
+        faceCrop?: FaceCrop;
     }>;
     imageHosting: ImageHostingSettings;
 };

@@ -37,6 +37,8 @@ import {
     loadRegexes,
     resolveUserIdentity,
 } from "./settings-storage";
+import { resolveChatAccountUserIdentity } from "./chat-scope-storage";
+import { buildChineseThinkingPrompt, withChineseThinkingPrompt } from "./chinese-thinking-prompt";
 import { assemblePromptPayload, applyOutputRegex, type LLMMessage, type LLMContentPart } from "./llm-prompt-assembler";
 import { MacroEngine, postProcessTrim } from "./macro-engine";
 import { getStatusRegionConfig, resolveStatusRegionSection, resolveStatusRegionExampleLine, resolveStatusRegionComposition, resolveStatusRegionFullExample } from "./chat-status-region";
@@ -62,7 +64,7 @@ import { loadMemoryConfig, incrementEventCounter } from "./memory-storage";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
 import { formatCoreMemories, formatLongTermMemories } from "./memory-injector";
 import { maybeRunSummarization } from "./memory-summarizer";
-import { prepareShortTermContext } from "./short-term-assembler";
+import { loadNativeTimelineAsync, prepareShortTermContext } from "./short-term-assembler";
 import { parseActionTags, dispatchActions } from "./action-parser";
 import { findEnabledToolForSchema, getEnabledTools, type EnabledTool } from "./tool-storage";
 import { formatToolsForPrompt, formatToolSchema } from "./tool-prompt";
@@ -854,6 +856,10 @@ export async function sendLLMStreamRequest(
             throw new ChatEngineError("流式响应没有解析到文本增量。");
         }
         let rawOutput = options?.skipTimestampStrip ? streamedContent.trim() : stripHallucinatedTimestamps(streamedContent.trim());
+        // 与 sendLLMRequest 一致：调用方要求时把思维链拼成 <think> 块放在正文前（剧情模式用）
+        if (options?.includeReasoning && streamedReasoning) {
+            rawOutput = `<think>\n${streamedReasoning}\n</think>\n\n${rawOutput}`;
+        }
         rawOutput = await applyChatPluginLlmResponse(rawOutput, pluginPurpose, options?.debugSessionId);
 
         // Store API log entry — mirror sendLLMRequest so streaming calls also show up
@@ -894,6 +900,47 @@ export async function sendLLMStreamRequest(
     } finally {
         clearTimeout(llmTimeout);
         detachExternalAbort();
+    }
+}
+
+/**
+ * 和 sendLLMRequest 同签名、同返回（一次拿到全文），但传输优先走流式。
+ * iOS Safari 对迟迟收不到任何响应数据的请求约 60 秒就判超时，非流式的长生成（剧情等）在 iPhone 上会必挂；
+ * 流式一开始就陆续有数据，不会被判空闲。界面不变，仍是收齐后整段显示。
+ * 什么都没收到就失败（接口或中转不支持 SSE 等）时退回 sendLLMRequest 重试一次；
+ * 已经收到正文或思考内容后再断开，或调用方主动中止，按原样抛出（避免同一次长生成计费两次）。
+ */
+export async function sendLLMRequestPreferStream(
+    config: ApiConfig,
+    preset: PresetConfig | null,
+    messages: LLMMessage[],
+    regexes: RegexConfig[],
+    meta?: { characterName?: string; userName?: string },
+    options?: Parameters<typeof sendLLMRequest>[5],
+): Promise<string> {
+    let received = false;
+    let reasoning = "";
+    try {
+        const result = await sendLLMStreamRequest(config, preset, messages, regexes, meta, {
+            skipOutputRegex: options?.skipOutputRegex,
+            includeReasoning: options?.includeReasoning,
+            appId: options?.appId,
+            appTags: options?.appTags,
+            followUpCount: options?.followUpCount,
+            debugSessionId: options?.debugSessionId,
+            signal: options?.signal,
+        }, {
+            onDelta: () => { received = true; },
+            onReasoningDelta: (text: string) => { received = true; reasoning += text; },
+        });
+        if (reasoning) {
+            try { options?.onReasoning?.(reasoning); } catch { /* 捕获回调异常，不影响主流程 */ }
+        }
+        return result.content;
+    } catch (error) {
+        if (received || options?.signal?.aborted) throw error;
+        console.warn("[ChatEngine] 流式请求没有收到内容，退回非流式重试：", error);
+        return sendLLMRequest(config, preset, messages, regexes, meta, options);
     }
 }
 
@@ -1825,6 +1872,9 @@ export async function buildChatPromptMessages(
     if (preset && promptProfile) {
         preset = applyCustomPromptProfileToPreset(preset, promptProfile);
     }
+    const chineseThinkingEnabled = session.chineseThinkingPromptEnabled === true
+        && resolvedAppId === "chat" && !options?.appTags?.includes("offline") && !promptProfile;
+    preset = withChineseThinkingPrompt(preset, chineseThinkingEnabled);
 
     const allWorldBooks = loadWorldBooks();
     const extraWorldBookIds = options?.extraWorldBookIds ?? [];
@@ -1838,7 +1888,9 @@ export async function buildChatPromptMessages(
         ? []
         : (activeSlot.regexIds || []).map(id => allRegexes.find(r => r.id === id)).filter(Boolean) as typeof allRegexes;
 
-    const userIdentity = resolveUserIdentity(character.id, resolvedAppId);
+    const userIdentity = resolvedAppId === "chat"
+        ? resolveChatAccountUserIdentity(session.chatAccountId, character.id, resolvedAppId)
+        : resolveUserIdentity(character.id, resolvedAppId);
     const attachedImages = config.enableImageRecognition === true ? options?.attachedImages : undefined;
     const historyForPrompt: ChatMessage[] = attachedImages?.length
         ? [
@@ -1868,11 +1920,22 @@ export async function buildChatPromptMessages(
     const toolsEnabled = enabledTools.length > 0
         && (options?.forceEnableTools === true || presetIncludesToolsMacro(preset, resolvedAppId, effectiveAppTags));
     const usesNativeActions = Boolean(toolsEnabled && nativeToolProtocolForConfig(config));
+    const timeline = await loadNativeTimelineAsync(character.id, {
+        appId: resolvedAppId as import("./settings-types").ContentAppId,
+        userName: userIdentity?.name,
+        excludeOfflineSessionId: options?.excludeOfflineSessionId,
+        excludeChatSessionId: isOfflineMode ? undefined : session.id,
+        promptTimestampOptions,
+    });
     const { recentBlocks, truncatedHistory, wbActivationContext, unifiedRecentItems } = prepareShortTermContext(character.id, resolvedAppId, {
+        timeline,
         history: historyForPrompt,
         includeDirectChatEntries: isOfflineMode,
         includeNativeToolHistory: usesNativeActions,
         excludeOfflineSessionId: options?.excludeOfflineSessionId,
+        chatAccountId: session.chatAccountId || null,
+        excludeChatSessionId: isOfflineMode ? undefined : session.id,
+        userName: userIdentity?.name,
         promptTimestampOptions,
     });
     const promptHistory = applyVisionImagePromptLimit(
@@ -1963,6 +2026,12 @@ export async function buildChatPromptMessages(
         offlineSummaryTag: preset?.story_summary_tag?.trim() || "summary",
         nativeToolHistory: usesNativeActions,
     });
+    if (chineseThinkingEnabled) {
+        llmMessages.push({ role: "system", content: buildChineseThinkingPrompt(
+            userIdentity?.name || "你", preset?.online_thinking_tag?.trim() || "thinking", [character.name],
+            session.chineseThinkingPromptLength,
+        ) });
+    }
     const avatarChangeIntent = !session.isGroup
         ? findUserAvatarChangeIntent(historyForPrompt, session.id, character.id)
         : null;
